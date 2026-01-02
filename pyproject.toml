@@ -1,0 +1,13 @@
+[project]
+    name = "ncm-crack"
+    version = "0.2.0"
+    description = "NCM file decryptor with full metadata and cover art support"
+    requires-python = ">=3.12"
+    dependencies = [
+        "eyed3>=0.9.9",
+        "mutagen>=1.47.0",
+        "psutil>=7.2.1",
+        "pycryptodome>=3.23.0",
+        "requests>=2.32.5",
+        "tqdm>=4.67.1",
+    ]
