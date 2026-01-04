@@ -282,6 +282,161 @@ def set_flac_metadata(
         return False
 
 
+def fix_mp3_artist_metadata(mp3_path: str) -> bool:
+    """修正 MP3 文件中使用 / 或混合分隔符的艺术家元数据
+
+    Args:
+        mp3_path: MP3 文件路径
+
+    Returns:
+        是否修正成功（如果无需修正则返回 None）
+    """
+    try:
+        audio = MP3(mp3_path, ID3=ID3)
+        if audio.tags is None:
+            return None
+
+        modified = False
+
+        def clean_artist_string(artist_text):
+            """清理艺术家字符串，处理多种分隔符"""
+            # 去除首尾空格和末尾的分号
+            artist_text = artist_text.strip().rstrip(";").strip()
+
+            # 检查是否需要处理
+            if "/" not in artist_text and "; " in artist_text:
+                # 已经是标准格式，无需处理
+                return None, artist_text
+
+            if "/" in artist_text or ";" in artist_text:
+                # 需要处理：先替换分号为斜杠，统一处理
+                artist_text = artist_text.replace(";", "/")
+                artists = [a.strip() for a in artist_text.split("/") if a.strip()]
+                # 去重并保持顺序
+                seen = set()
+                unique_artists = []
+                for artist in artists:
+                    if artist not in seen:
+                        seen.add(artist)
+                        unique_artists.append(artist)
+                return True, "; ".join(unique_artists)
+
+            return None, artist_text
+
+        # 检查并修正艺术家字段（TPE1）
+        if "TPE1" in audio.tags:
+            artist_text = str(audio.tags["TPE1"].text[0])
+            needs_fix, cleaned_text = clean_artist_string(artist_text)
+            if needs_fix:
+                audio.tags["TPE1"] = TPE1(encoding=3, text=cleaned_text)
+                modified = True
+
+        # 检查并修正专辑艺术家字段（TPE2）
+        if "TPE2" in audio.tags:
+            album_artist_text = str(audio.tags["TPE2"].text[0])
+            needs_fix, cleaned_text = clean_artist_string(album_artist_text)
+            if needs_fix:
+                audio.tags["TPE2"] = TPE2(encoding=3, text=cleaned_text)
+                modified = True
+
+        if modified:
+            audio.save()
+            return True
+        return None
+
+    except Exception as e:
+        warnings.warn(f"修正 MP3 元数据失败: {e}")
+        return False
+
+
+def fix_flac_artist_metadata(flac_path: str) -> bool:
+    """修正 FLAC 文件中使用 / 或 ; 分隔的艺术家元数据
+
+    Args:
+        flac_path: FLAC 文件路径
+
+    Returns:
+        是否修正成功（如果无需修正则返回 None）
+    """
+    try:
+        audio = FLAC(flac_path)
+        modified = False
+
+        def clean_artist_list(artists_input):
+            """清理并分割艺术家列表"""
+            new_artists = []
+            needs_fix = False
+
+            for artist in artists_input:
+                # 先去除首尾空格和末尾的分号
+                artist_cleaned = artist.strip().rstrip(";").strip()
+
+                # 检查是否包含分隔符
+                if "/" in artist_cleaned or ";" in artist_cleaned:
+                    needs_fix = True
+                    # 先按分号分割，再按斜杠分割
+                    parts = artist_cleaned.split(";")
+                    for part in parts:
+                        sub_parts = part.split("/")
+                        for sub_part in sub_parts:
+                            cleaned = sub_part.strip()
+                            if cleaned and cleaned not in new_artists:
+                                new_artists.append(cleaned)
+                else:
+                    # 没有分隔符，直接添加
+                    if artist_cleaned and artist_cleaned not in new_artists:
+                        new_artists.append(artist_cleaned)
+
+            return new_artists, needs_fix
+
+        # 检查并修正艺术家字段
+        if "ARTIST" in audio:
+            new_artists, needs_fix = clean_artist_list(audio["ARTIST"])
+            if needs_fix:
+                audio["ARTIST"] = new_artists
+                modified = True
+
+        # 检查并修正专辑艺术家字段
+        if "ALBUMARTIST" in audio:
+            new_album_artists, needs_fix = clean_artist_list(audio["ALBUMARTIST"])
+            if needs_fix:
+                audio["ALBUMARTIST"] = new_album_artists
+                modified = True
+
+        if modified:
+            audio.save()
+            return True
+        return None
+
+    except Exception as e:
+        warnings.warn(f"修正 FLAC 元数据失败: {e}")
+        return False
+
+
+def fix_audio_metadata(audio_path: str) -> bool:
+    """修正音频文件中的艺术家元数据（支持 MP3 和 FLAC）
+
+    Args:
+        audio_path: 音频文件路径
+
+    Returns:
+        是否修正成功（如果无需修正则返回 None）
+    """
+    audio_path = Path(audio_path)
+    file_format = audio_path.suffix.lower()[1:]
+
+    try:
+        if file_format == "mp3":
+            return fix_mp3_artist_metadata(str(audio_path))
+        elif file_format == "flac":
+            return fix_flac_artist_metadata(str(audio_path))
+        else:
+            return None
+    except Exception as e:
+        warnings.warn(f"修正元数据失败: {e}")
+        return False
+
+
 def set_audio_metadata(audio_path: str, metadata: dict) -> bool:
     """为音频文件设置完整元数据和封面（支持 MP3 和 FLAC）
 
@@ -464,7 +619,25 @@ class NCMDecryptor:
 class BatchConverter:
     """批量转换 NCM 文件，支持递归目录遍历和文件复制"""
 
-    def __init__(self, input_dir: str, output_dir: Optional[str] = None):
+    # 默认黑名单文件夹（这些文件夹将被跳过）
+    DEFAULT_BLACKLIST = {
+        "__pycache__",
+        ".git",
+        ".svn",
+        ".hg",
+        "node_modules",
+        ".idea",
+        ".vscode",
+        "Output",  # 避免扫描输出目录
+    }
+
+    def __init__(
+        self,
+        input_dir: str,
+        output_dir: Optional[str] = None,
+        folder_blacklist: Optional[set] = None,
+        overwrite: bool = False,
+    ):
         self.input_dir = Path(input_dir)
         # 默认输出目录为 Music 同级的 Output 文件夹
         if output_dir:
@@ -474,6 +647,14 @@ class BatchConverter:
             self.output_dir = self.input_dir.parent / "Output"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # 设置文件夹黑名单（合并默认黑名单和用户自定义黑名单）
+        self.folder_blacklist = self.DEFAULT_BLACKLIST.copy()
+        if folder_blacklist:
+            self.folder_blacklist.update(folder_blacklist)
+
+        # 是否覆写已存在的文件
+        self.overwrite = overwrite
+
     def _get_relative_output_path(self, input_file: Path) -> Path:
         """获取文件对应的输出路径（保持目录结构）"""
         rel_path = input_file.relative_to(self.input_dir)
@@ -481,6 +662,10 @@ class BatchConverter:
 
     def _is_already_converted(self, output_path: Path, base_name: str) -> bool:
         """检查文件是否已转换"""
+        # 如果设置了覆写，则总是返回 False（即总是转换）
+        if self.overwrite:
+            return False
+
         parent_dir = output_path.parent
         base_path = parent_dir / base_name
         return (
@@ -537,30 +722,55 @@ class BatchConverter:
         return False
 
     def _copy_single_file(self, src_path: Path, dst_path: Path) -> bool:
-        """复制单个非 NCM 文件
+        """复制单个非 NCM 文件，并修正音频文件的元数据
 
         Args:
             src_path: 源文件路径
             dst_path: 目标文件路径
 
         Returns:
-            是否复制成功
+            是否复制成功（True: 成功, False: 失败, None: 跳过）
         """
         try:
-            # 如果目标文件已存在，跳过
-            if dst_path.exists():
+            # 检查是否需要覆写
+            if dst_path.exists() and not self.overwrite:
                 return None
 
             # 确保目标目录存在
             dst_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # 判断是否为音频文件
+            is_audio = dst_path.suffix.lower() in [".mp3", ".flac"]
+
             # 复制文件
             shutil.copy2(src_path, dst_path)
+
+            # 如果是音频文件，修正元数据
+            if is_audio:
+                fix_result = fix_audio_metadata(str(dst_path))
+                # fix_result: True=已修正, False=失败, None=无需修正
+                # 即使修正失败，复制操作也算成功
+
             return True
 
         except Exception as e:
             print(f"复制文件失败: {src_path} -> {dst_path}: {e}")
             return False
+
+    def _is_blacklisted(self, path: Path) -> bool:
+        """检查路径是否在黑名单中
+
+        Args:
+            path: 要检查的路径
+
+        Returns:
+            是否在黑名单中
+        """
+        # 检查路径中的所有文件夹名称
+        for part in path.parts:
+            if part in self.folder_blacklist:
+                return True
+        return False
 
     def _collect_all_files(self) -> Tuple[list, list]:
         """收集所有需要处理的文件
@@ -574,6 +784,11 @@ class BatchConverter:
         # 递归遍历所有文件
         for file_path in self.input_dir.rglob("*"):
             if file_path.is_file():
+                # 检查是否在黑名单中
+                rel_path = file_path.relative_to(self.input_dir)
+                if self._is_blacklisted(rel_path):
+                    continue
+
                 if file_path.suffix.lower() == ".ncm":
                     ncm_files.append(file_path)
                 else:
@@ -692,6 +907,20 @@ def main():
         help="输出目录路径（默认为输入目录的同级 Output 目录）",
     )
 
+    parser.add_argument(
+        "-b",
+        "--blacklist",
+        nargs="*",
+        help="要跳过的文件夹名称列表（空格分隔）。例如: -b temp cache backup",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--overwrite",
+        action="store_true",
+        help="覆写已存在的文件（用于库更新和元数据修正）",
+    )
+
     args = parser.parse_args()
 
     # 验证输入路径
@@ -701,8 +930,14 @@ def main():
 
     # 执行转换
     print(f"输入目录: {args.path}")
-    converter = BatchConverter(args.path, args.output)
+
+    # 创建黑名单集合
+    custom_blacklist = set(args.blacklist) if args.blacklist else None
+    converter = BatchConverter(args.path, args.output, custom_blacklist, args.overwrite)
+
     print(f"输出目录: {converter.output_dir}")
+    print(f"黑名单文件夹: {', '.join(sorted(converter.folder_blacklist))}")
+    print(f"覆写模式: {'开启' if args.overwrite else '关闭'}")
     print()
 
     stats = converter.convert_all()
