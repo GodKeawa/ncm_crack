@@ -23,7 +23,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.strxor import strxor
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import ID3
-from mutagen.id3._frames import APIC, TIT2, TPE1, TALB, TDRC
+from mutagen.id3._frames import APIC, TIT2, TPE1, TPE2, TALB, TDRC, TRCK, COMM, TLEN
 from mutagen.mp3 import MP3
 from tqdm import tqdm
 
@@ -126,22 +126,52 @@ def set_mp3_metadata(
         if "musicName" in metadata:
             audio.tags["TIT2"] = TIT2(encoding=3, text=metadata["musicName"])
 
+        # 处理艺术家 - 使用分号分隔符（ID3v2标准推荐）
         if "artist" in metadata:
             artists = metadata["artist"]
             if isinstance(artists, list):
+                # NCM格式: [["Artist1", ID1], ["Artist2", ID2]]
                 artist_names = [
                     a[0] if isinstance(a, list) and a else str(a) for a in artists
                 ]
-                audio.tags["TPE1"] = TPE1(encoding=3, text="/".join(artist_names))
+                # 使用分号+空格分隔多个艺术家（最佳兼容性）
+                audio.tags["TPE1"] = TPE1(encoding=3, text="; ".join(artist_names))
             else:
                 audio.tags["TPE1"] = TPE1(encoding=3, text=str(artists))
 
         if "album" in metadata:
             audio.tags["TALB"] = TALB(encoding=3, text=metadata["album"])
 
+        # 专辑艺术家（与艺术家相同）
+        if "artist" in metadata:
+            artists = metadata["artist"]
+            if isinstance(artists, list):
+                artist_names = [
+                    a[0] if isinstance(a, list) and a else str(a) for a in artists
+                ]
+                audio.tags["TPE2"] = TPE2(encoding=3, text="; ".join(artist_names))
+            else:
+                audio.tags["TPE2"] = TPE2(encoding=3, text=str(artists))
+
         if "publishTime" in metadata:
             year = str(metadata["publishTime"])[:4]  # 提取年份
             audio.tags["TDRC"] = TDRC(encoding=3, text=year)
+
+        # 时长（毫秒转换为毫秒，ID3v2.3/2.4使用毫秒）
+        if "duration" in metadata:
+            duration_ms = metadata["duration"]
+            audio.tags["TLEN"] = TLEN(encoding=3, text=str(duration_ms))
+
+        # 添加备注信息（包含别名和翻译名）
+        comments = []
+        if "alias" in metadata and metadata["alias"]:
+            comments.append("别名: " + "; ".join(metadata["alias"]))
+        if "transNames" in metadata and metadata["transNames"]:
+            comments.append("翻译: " + "; ".join(metadata["transNames"]))
+        if comments:
+            audio.tags["COMM"] = COMM(
+                encoding=3, lang="chi", desc="", text="\n".join(comments)
+            )
 
         # 添加封面
         if cover_data:
@@ -181,22 +211,56 @@ def set_flac_metadata(
         if "musicName" in metadata:
             audio["TITLE"] = metadata["musicName"]
 
+        # 处理艺术家 - Vorbis Comments支持列表（推荐方式）
         if "artist" in metadata:
             artists = metadata["artist"]
             if isinstance(artists, list):
+                # NCM格式: [["Artist1", ID1], ["Artist2", ID2]]
                 artist_names = [
                     a[0] if isinstance(a, list) and a else str(a) for a in artists
                 ]
-                audio["ARTIST"] = "/".join(artist_names)
+                # 直接传递列表，mutagen会自动创建多个ARTIST字段（Vorbis标准）
+                audio["ARTIST"] = artist_names
             else:
                 audio["ARTIST"] = str(artists)
 
         if "album" in metadata:
             audio["ALBUM"] = metadata["album"]
 
+        # 专辑艺术家（与艺术家相同）
+        if "artist" in metadata:
+            artists = metadata["artist"]
+            if isinstance(artists, list):
+                artist_names = [
+                    a[0] if isinstance(a, list) and a else str(a) for a in artists
+                ]
+                audio["ALBUMARTIST"] = artist_names
+            else:
+                audio["ALBUMARTIST"] = str(artists)
+
         if "publishTime" in metadata:
             year = str(metadata["publishTime"])[:4]
             audio["DATE"] = year
+
+        # 添加别名和翻译名
+        if "alias" in metadata and metadata["alias"]:
+            # 使用SUBTITLE字段存储别名
+            audio["SUBTITLE"] = metadata["alias"]
+
+        if "transNames" in metadata and metadata["transNames"]:
+            # 使用DESCRIPTION存储翻译名
+            audio["DESCRIPTION"] = metadata["transNames"]
+
+        # 添加比特率和时长信息到COMMENT
+        comments = []
+        if "bitrate" in metadata:
+            bitrate_kbps = metadata["bitrate"] // 1000
+            comments.append(f"Bitrate: {bitrate_kbps} kbps")
+        if "duration" in metadata:
+            duration_sec = metadata["duration"] / 1000
+            comments.append(f"Duration: {duration_sec:.2f}s")
+        if comments:
+            audio["COMMENT"] = "; ".join(comments)
 
         # 添加封面
         if cover_data:
