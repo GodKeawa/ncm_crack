@@ -15,6 +15,8 @@
   - 其他文件（图片、文本等）直接复制到对应位置
 - **批量转换**：支持目录批量转换，自动跳过已转换文件
 - **多线程处理**：利用多核 CPU 提升转换速度（默认使用 100% CPU 核心）
+- **黑名单机制**：跳过特定文件夹（如系统文件夹、缓存等）
+- **覆写模式**：支持重新处理已存在的文件，用于库更新和元数据修正
 
 ## 使用方法
 
@@ -29,12 +31,30 @@ python ncm_crack.py -p ./MyMusic
 
 # 同时指定输入和输出文件夹
 python ncm_crack.py -p ./MyMusic -o ./ConvertedMusic
+
+# 启用覆写模式（重新处理已存在的文件）
+python ncm_crack.py -f
+
+# 组合使用
+python ncm_crack.py -p ./Music -o ./Output -b demo test -f
 ```
 
 ### 参数说明
 
 - `-p, --path`：输入目录路径（默认：`./Music`）
 - `-o, --output`：输出目录路径（默认：输入目录同级的 `Output` 文件夹）
+- `-b, --blacklist`：要跳过的文件夹名称列表（空格分隔）
+- `-f, --overwrite`：覆写已存在的文件（用于库更新和元数据修正）
+
+
+### 黑名单机制
+
+默认跳过以下文件夹：
+- 系统文件夹：`__pycache__`, `.git`, `.svn`, `.hg`, `.idea`, `.vscode`
+- 依赖文件夹：`node_modules`
+- 输出目录：`Output`
+
+可通过 `-b` 参数添加自定义黑名单文件夹。
 
 
 ## 依赖说明
@@ -51,9 +71,3 @@ python ncm_crack.py -p ./MyMusic -o ./ConvertedMusic
 ```bash
 uv sync
 ```
-
-## 注意事项
-
-- 程序会自动创建输出目录，无需手动创建
-- 已转换的文件会被自动跳过，不会重复处理
-- 支持中断后继续运行，只处理未完成的文件
