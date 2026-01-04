@@ -8,6 +8,7 @@ import base64
 import binascii
 import json
 import os
+import shutil
 import struct
 import time
 import warnings
@@ -21,7 +22,8 @@ import requests
 from Crypto.Cipher import AES
 from Crypto.Util.strxor import strxor
 from mutagen.flac import FLAC, Picture
-from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC
+from mutagen.id3 import ID3
+from mutagen.id3._frames import APIC, TIT2, TPE1, TALB, TDRC
 from mutagen.mp3 import MP3
 from tqdm import tqdm
 
@@ -396,36 +398,52 @@ class NCMDecryptor:
 
 # ==================== 批量转换器 ====================
 class BatchConverter:
-    """批量转换 NCM 文件"""
+    """批量转换 NCM 文件，支持递归目录遍历和文件复制"""
 
     def __init__(self, input_dir: str, output_dir: Optional[str] = None):
         self.input_dir = Path(input_dir)
-        self.output_dir = Path(output_dir) if output_dir else self.input_dir / "output"
-        self.output_dir.mkdir(exist_ok=True)
+        # 默认输出目录为 Music 同级的 Output 文件夹
+        if output_dir:
+            self.output_dir = Path(output_dir)
+        else:
+            # 使用独立的输出目录
+            self.output_dir = self.input_dir.parent / "Output"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def _is_already_converted(self, base_name: str) -> bool:
+    def _get_relative_output_path(self, input_file: Path) -> Path:
+        """获取文件对应的输出路径（保持目录结构）"""
+        rel_path = input_file.relative_to(self.input_dir)
+        return self.output_dir / rel_path
+
+    def _is_already_converted(self, output_path: Path, base_name: str) -> bool:
         """检查文件是否已转换"""
-        base_path = self.output_dir / base_name
+        parent_dir = output_path.parent
+        base_path = parent_dir / base_name
         return (
             base_path.with_suffix(".mp3").exists()
             or base_path.with_suffix(".flac").exists()
         )
 
     def _convert_single_file(
-        self, ncm_path: Path, max_retries: int = 5
+        self, ncm_path: Path, output_path: Path, max_retries: int = 5
     ) -> Optional[bool]:
-        """转换单个文件
+        """转换单个 NCM 文件
+
+        Args:
+            ncm_path: NCM 文件路径
+            output_path: 输出文件路径（不含扩展名）
+            max_retries: 最大重试次数
 
         Returns:
             True: 成功, False: 失败, None: 跳过
         """
-        if ncm_path.suffix.lower() != ".ncm":
-            return None
-
         # 检查是否已转换
         base_name = ncm_path.stem
-        if self._is_already_converted(base_name):
+        if self._is_already_converted(output_path, base_name):
             return None
+
+        # 确保输出目录存在
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 多次重试
         for attempt in range(max_retries):
@@ -435,9 +453,9 @@ class BatchConverter:
                     time.sleep(0.5)
 
                 # 解密文件
-                output_path = self.output_dir / f"{base_name}.mp3"  # 临时扩展名
+                temp_output = output_path.parent / f"{base_name}.mp3"  # 临时扩展名
                 decryptor = NCMDecryptor(str(ncm_path))
-                final_path, metadata = decryptor.decrypt(str(output_path))
+                final_path, metadata = decryptor.decrypt(str(temp_output))
 
                 # 设置元数据和封面
                 if metadata:
@@ -449,56 +467,140 @@ class BatchConverter:
                 if attempt < max_retries - 1:
                     time.sleep(3)
                 else:
-                    print(f"转换失败: {ncm_path.name} - {e}")
+                    print(f"转换失败: {ncm_path} - {e}")
                     return False
 
         return False
 
+    def _copy_single_file(self, src_path: Path, dst_path: Path) -> bool:
+        """复制单个非 NCM 文件
+
+        Args:
+            src_path: 源文件路径
+            dst_path: 目标文件路径
+
+        Returns:
+            是否复制成功
+        """
+        try:
+            # 如果目标文件已存在，跳过
+            if dst_path.exists():
+                return None
+
+            # 确保目标目录存在
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 复制文件
+            shutil.copy2(src_path, dst_path)
+            return True
+
+        except Exception as e:
+            print(f"复制文件失败: {src_path} -> {dst_path}: {e}")
+            return False
+
+    def _collect_all_files(self) -> Tuple[list, list]:
+        """收集所有需要处理的文件
+
+        Returns:
+            (ncm_files列表, other_files列表)
+        """
+        ncm_files = []
+        other_files = []
+
+        # 递归遍历所有文件
+        for file_path in self.input_dir.rglob("*"):
+            if file_path.is_file():
+                if file_path.suffix.lower() == ".ncm":
+                    ncm_files.append(file_path)
+                else:
+                    other_files.append(file_path)
+
+        return ncm_files, other_files
+
     def convert_all(self, max_workers: Optional[int] = None) -> dict:
-        """批量转换所有 NCM 文件
+        """批量转换所有 NCM 文件并复制其他文件
 
         Args:
             max_workers: 最大线程数，默认为 CPU 核心数的 80%
 
         Returns:
-            统计字典 {'success': int, 'failed': int, 'skipped': int}
+            统计字典 {'ncm_success': int, 'ncm_failed': int, 'ncm_skipped': int,
+                     'copy_success': int, 'copy_failed': int, 'copy_skipped': int}
         """
-        # 收集所有 NCM 文件
-        ncm_files = list(self.input_dir.glob("*.ncm"))
+        # 收集所有文件
+        print("正在扫描文件...")
+        ncm_files, other_files = self._collect_all_files()
 
-        if not ncm_files:
-            print(f"在 {self.input_dir} 中未找到 NCM 文件")
-            return {"success": 0, "failed": 0, "skipped": 0}
+        total_files = len(ncm_files) + len(other_files)
+        if total_files == 0:
+            print(f"在 {self.input_dir} 中未找到任何文件")
+            return {
+                "ncm_success": 0,
+                "ncm_failed": 0,
+                "ncm_skipped": 0,
+                "copy_success": 0,
+                "copy_failed": 0,
+                "copy_skipped": 0,
+            }
+
+        print(f"找到 {len(ncm_files)} 个 NCM 文件，{len(other_files)} 个其他文件")
+        print()
 
         # 确定线程数
         if max_workers is None:
             cpu_count = os.cpu_count() or 1
             max_workers = max(1, int(cpu_count * 0.8))
 
-        stats = {"success": 0, "failed": 0, "skipped": 0}
+        stats = {
+            "ncm_success": 0,
+            "ncm_failed": 0,
+            "ncm_skipped": 0,
+            "copy_success": 0,
+            "copy_failed": 0,
+            "copy_skipped": 0,
+        }
 
-        # 并行转换
+        # 并行处理
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(self._convert_single_file, ncm_file)
-                for ncm_file in ncm_files
-            ]
+            futures = []
+
+            # 提交 NCM 转换任务
+            for ncm_file in ncm_files:
+                output_path = self._get_relative_output_path(ncm_file)
+                future = executor.submit(
+                    self._convert_single_file, ncm_file, output_path
+                )
+                futures.append(("ncm", future))
+
+            # 提交文件复制任务
+            for other_file in other_files:
+                dst_path = self._get_relative_output_path(other_file)
+                future = executor.submit(self._copy_single_file, other_file, dst_path)
+                futures.append(("copy", future))
 
             # 显示进度
-            with tqdm(total=len(futures), desc="转换进度", unit="文件") as pbar:
-                for future in futures:
+            with tqdm(total=len(futures), desc="处理进度", unit="文件") as pbar:
+                for file_type, future in futures:
                     future.add_done_callback(lambda _: pbar.update(1))
-                wait(futures)
+                wait([f for _, f in futures])
 
             # 统计结果
-            for future in futures:
+            for file_type, future in futures:
                 result = future.result()
-                if result is True:
-                    stats["success"] += 1
-                elif result is False:
-                    stats["failed"] += 1
-                else:
-                    stats["skipped"] += 1
+                if file_type == "ncm":
+                    if result is True:
+                        stats["ncm_success"] += 1
+                    elif result is False:
+                        stats["ncm_failed"] += 1
+                    else:
+                        stats["ncm_skipped"] += 1
+                else:  # copy
+                    if result is True:
+                        stats["copy_success"] += 1
+                    elif result is False:
+                        stats["copy_failed"] += 1
+                    else:
+                        stats["copy_skipped"] += 1
 
         return stats
 
@@ -511,10 +613,19 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("-p", "--path", required=True, help="包含 NCM 文件的目录路径")
+    # 设置默认输入路径为当前目录下的 Music 文件夹
+    default_input = Path.cwd() / "Music"
+    parser.add_argument(
+        "-p",
+        "--path",
+        default=str(default_input),
+        help=f"包含 NCM 文件的目录路径（默认: {default_input}）",
+    )
 
     parser.add_argument(
-        "-o", "--output", help="输出目录路径（默认为输入目录下的 output 子目录）"
+        "-o",
+        "--output",
+        help="输出目录路径（默认为输入目录的同级 Output 目录）",
     )
 
     args = parser.parse_args()
@@ -533,10 +644,15 @@ def main():
     stats = converter.convert_all()
 
     # 显示统计
-    print(f"\n转换完成!")
-    print(f"  成功: {stats['success']} 个文件")
-    print(f"  失败: {stats['failed']} 个文件")
-    print(f"  跳过: {stats['skipped']} 个文件")
+    print(f"\n处理完成!")
+    print(f"\nNCM 转换:")
+    print(f"  成功: {stats['ncm_success']} 个文件")
+    print(f"  失败: {stats['ncm_failed']} 个文件")
+    print(f"  跳过: {stats['ncm_skipped']} 个文件")
+    print(f"\n文件复制:")
+    print(f"  成功: {stats['copy_success']} 个文件")
+    print(f"  失败: {stats['copy_failed']} 个文件")
+    print(f"  跳过: {stats['copy_skipped']} 个文件")
 
 
 if __name__ == "__main__":
